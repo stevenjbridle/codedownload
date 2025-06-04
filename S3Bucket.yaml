@@ -1,0 +1,80 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template to create an S3 bucket with default SSE-S3 encryption and HTTPS-only access.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: A globally unique name for your S3 bucket.
+    ConstraintDescription: Must be a unique S3 bucket name.
+    Default: 'my-secure-app-data-bucket-cloudformation-2025' # REMEMBER TO CHANGE THIS TO A GLOBALLY UNIQUE NAME
+
+Resources:
+  SecureS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      Tags:
+        - Key: Environment
+          Value: Dev
+        - Key: Project
+          Value: SecureApp
+      # Optional: Enable Versioning for data protection
+      # VersioningConfiguration:
+      #   Status: Enabled
+      # Optional: Enable Public Access Block for security best practices
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+  # Resource to apply default encryption to the S3 bucket
+  S3BucketEncryption:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SecureS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Statement for Default Encryption (SSE-S3)
+          # Note: This is now handled by the Bucket resource itself for default encryption.
+          # We'll use the BucketPolicy for the HTTPS enforcement.
+          # For SSE-S3, the S3::Bucket resource now has an 'BucketEncryption' property.
+          # The policy below will ONLY be for the HTTPS enforcement.
+
+          # HTTPS Only Enforcement Policy
+          - Sid: DenyUnencryptedTraffic
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt SecureS3Bucket.Arn
+              - !Join ['', [!GetAtt SecureS3Bucket.Arn, '/*']]
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # New resource for Bucket Encryption configuration (preferred way for default encryption)
+  # This configures default SSE-S3 encryption.
+  S3BucketDefaultEncryption:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName # Reference to the same bucket
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256 # For SSE-S3 (S3-managed keys)
+
+      # If you wanted SSE-KMS with an existing KMS key:
+      # ServerSideEncryptionConfiguration:
+      #   - ServerSideEncryptionByDefault:
+      #       SSEAlgorithm: aws:kms
+      #       KMSMasterKeyID: arn:aws:kms:your-aws-region:123456789012:key/your-kms-key-id # Replace with your KMS Key ARN
+
+Outputs:
+  BucketName:
+    Description: Name of the newly created S3 bucket.
+    Value: !Ref SecureS3Bucket
+  BucketArn:
+    Description: ARN of the newly created S3 bucket.
+    Value: !GetAtt SecureS3Bucket.Arn
