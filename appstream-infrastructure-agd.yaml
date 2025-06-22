@@ -1,0 +1,318 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS AppStream 2.0 Stack and Fleet with Optional AD Integration and Tagging
+
+Parameters:
+  Environment: 
+    Type: String
+    Default: sandpit
+  Classification: 
+    Type: String
+    Default: unclassified
+  # --- Stack Configuration Parameters ---
+  HomeFoldersEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: |
+      Set to 'true' to enable home folders for the AppStream stack,
+      persisting user settings and data in Amazon S3.
+  CopyPasteRestriction:
+    Type: String
+    Default: 'NONE'
+    AllowedValues: ['ALL', 'FROM-LOCAL-TO-REMOTE', 'FROM-REMOTE-TO-LOCAL', 'NONE']
+    Description: |
+      Specifies the copy/paste restriction for the stack.
+      - ALL: Allows copy/paste in both directions.
+      - FROM-LOCAL-TO-REMOTE: Only allows copying from local device to remote session.
+      - FROM-REMOTE-TO-LOCAL: Only allows copying from remote session to local device.
+      - NONE: Disables all copy/paste.
+  PasswordSignInForAD:
+    Type: String
+    Default: 'DISABLED'
+    AllowedValues: ['ENABLED', 'DISABLED']
+    Description: |
+      Set to 'ENABLED' to enable password sign-in for Active Directory users on the stack.
+      Requires Active Directory integration to be enabled for the fleet.
+  FileTransferRestriction:
+    Type: String
+    Default: 'DISABLED'
+    AllowedValues: ['ENABLED', 'DISABLED']
+    Description: |
+      Specifies the file transfer restriction for the stack.
+      - ENABLED: Allows both file upload and download.
+      - DISABLED: Disables both file upload and download.
+  LocalPrintingDisabled:
+    Type: String
+    Default: 'DISABLED'
+    AllowedValues: ['DISABLED', 'ENABLED']
+    Description: |
+      Set to 'DISABLED' to disable printing to local devices from AppStream sessions.
+
+  # --- Fleet Configuration Parameters ---
+  FleetName:
+    Type: String
+    Description: A unique name for the AppStream Fleet.
+  FleetInstanceType:
+    Type: String
+    Default: 'stream.standard.medium'
+    Description: The instance type for the fleet (e.g., stream.standard.medium, stream.compute.large).
+  FleetType:
+    Type: String
+    Default: 'ON_DEMAND'
+    AllowedValues: ['ON_DEMAND', 'ALWAYS_ON']
+    Description: |
+      The type of fleet.
+      - ON_DEMAND: Instances are provisioned when users connect.
+      - ALWAYS_ON: Instances are always running, ready for immediate use.
+  IdleDisconnectTimeoutInSeconds:
+    Type: Number
+    Default: 7200
+    Description: |
+      The amount of time (in seconds) that a streaming session remains active
+      after users disconnect. Sessions will be terminated after this period.
+  FleetDesiredCapacity:
+    Type: Number
+    Default: 1
+    Description: The desired number of streaming instances (desired sessions) in the fleet.
+  FleetIamRoleArn:
+    Type: String
+    Description: |
+      The ARN of the IAM role that AppStream can assume to access your resources
+      (e.g., for accessing S3 buckets for home folders, or joining Active Directory).
+  VpcId:
+    Type: String
+    Description: The ID of the VPC where the fleet instances will be launched.
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of subnet IDs within your VPC for fleet instances.
+  SecurityGroupIds:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of security group IDs for the fleet instances.
+  
+  # --- Optional Directory Configuration Parameters ---
+  EnableDirectoryConfig:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: |
+      Set to 'true' to enable Active Directory integration for the fleet.
+      If 'false', DirectoryName, OrganizationalUnitDistinguishedNames,
+      ServiceAccountUsername, and ServiceAccountPassword are ignored.
+  DirectoryName:
+    Type: String
+    Default: ''
+    Description: |
+      The name of the Active Directory (e.g., "mycompany.com").
+      Required if EnableDirectoryConfig is 'true'.
+  OrganizationalUnitDistinguishedNames:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: |
+      Comma-separated list of Active Directory Organizational Unit (OU)
+      distinguished names where computer accounts will be created
+      (e.g., "OU=AppStream,DC=mycompany,DC=com").
+      Required if EnableDirectoryConfig is 'true'.
+  ServiceAccountUsername:
+    Type: String
+    Default: ''
+    Description: |
+      The username of a service account in Active Directory with permissions to
+      create computer objects in the specified OUs.
+      Required if EnableDirectoryConfig is 'true'.
+  ServiceAccountPassword:
+    Type: String
+    Default: ''
+    NoEcho: true # Hides the value in CloudFormation console for security
+    Description: |
+      The password for the service account in Active Directory.
+      Required if EnableDirectoryConfig is 'true'.
+
+Mappings:
+  # This mapping defines the permission settings for clipboard copy based on the CopyPasteRestriction parameter.
+  # Mapping keys updated to use hyphens instead of underscores as required by CloudFormation.
+  CopyPastePermissionsMap:
+    ALL:
+      LocalToRemote: ENABLED
+      RemoteToLocal: ENABLED
+    FROM-LOCAL-TO-REMOTE: # Changed from FROM_LOCAL_TO_REMOTE
+      LocalToRemote: ENABLED
+      RemoteToLocal: DISABLED
+    FROM-REMOTE-TO-LOCAL: # Changed from FROM_REMOTE_TO_LOCAL
+      LocalToRemote: DISABLED
+      RemoteToLocal: ENABLED
+    NONE:
+      LocalToRemote: DISABLED
+      RemoteToLocal: DISABLED
+Conditions:
+  # Condition to determine if Active Directory integration should be configured
+  UseDirectoryConfig: !Equals [!Ref EnableDirectoryConfig, 'true']
+
+Resources:
+  # --- AppStream Stack Resource ---
+  AppStreamFleetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      # Dynamic GroupName based on Environment parameter
+      GroupName: !Sub 'agd-data-analysis-${Environment}-sg-appstream'
+      GroupDescription: !Sub 'Security group for AppStream fleet instances in ${Environment} environment.'
+      VpcId: !Ref VpcId # Associate with the specified VPC
+      SecurityGroupIngress:
+        # AppStream Streaming Protocols (TCP 8000-8002, 8443, etc.)
+        # These ports are required for client connectivity.
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8002
+          CidrIp: 0.0.0.0/0 # Allow from all IPs for general access (restrict as needed)
+          Description: AppStream Streaming Ports (8000-8002)
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: 0.0.0.0/0
+          Description: AppStream Streaming Port (8443)
+        # Add any other specific inbound rules required by your applications
+        # For example, if you need RDP for image building or specific application ports.
+      SecurityGroupEgress:
+        # Allow all outbound traffic to the internet
+        - IpProtocol: -1 # -1 means all protocols
+          FromPort: -1 # -1 means all ports
+          ToPort: -1 # -1 means all ports
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags: # Tagging for the AppStream Fleet
+        - Key: environment
+          Value: !Ref Environment
+        - Key: context
+          Value: 'infrastructure'          
+        - Key: project
+          Value: 'DEBI'
+        - Key: budgetcode
+          Value: '0000'
+        - Key: role
+          Value: euc
+        - Key: classification
+          Value: !Ref Classification
+
+  AppStreamStack:
+    Type: AWS::AppStream::Stack
+    Properties:
+      Name: !Sub '${Environment}-AppStreamStack' # Unique name for the stack
+      Description: AppStream 2.0 Stack created via CloudFormation
+      ApplicationSettings:
+        # 'Enabled: true' allows user settings and data to be persisted in their S3 home folder.
+       # Enabled: !Sub ${HomeFoldersEnabled}
+        Enabled: true
+        SettingsGroup: !Sub 'AGD-${Environment}-AppSettings'
+        # SettingsGroup can be used for custom paths for persistent application settings,
+        # but is optional for basic home folder functionality.
+      UserSettings:
+        # User setting for clipboard copy from local device to remote session
+        - Action: CLIPBOARD_COPY_FROM_LOCAL_DEVICE
+          Permission: !FindInMap
+            - CopyPastePermissionsMap
+            - !Ref CopyPasteRestriction
+            - LocalToRemote
+        # User setting for clipboard copy from remote session to local device
+        - Action: CLIPBOARD_COPY_TO_LOCAL_DEVICE
+          Permission: !FindInMap
+            - CopyPastePermissionsMap
+            - !Ref CopyPasteRestriction
+            - RemoteToLocal
+        # User setting for file upload
+        - Action: FILE_UPLOAD
+          Permission: !Ref FileTransferRestriction
+        # User setting for file download
+        - Action: FILE_DOWNLOAD
+          Permission: !Ref FileTransferRestriction
+        # User setting for printing to local device
+        - Action: PRINTING_TO_LOCAL_DEVICE
+          Permission: !Ref LocalPrintingDisabled
+        # User setting for Smart Card Authentication (disabled by default as not requested)
+        - Action: DOMAIN_SMART_CARD_SIGNIN
+          Permission: DISABLED
+        # User setting for Active Directory password sign-in
+        - Action: DOMAIN_PASSWORD_SIGNIN
+          Permission: ENABLED
+
+      Tags: # Tagging for the AppStream Stack
+        - Key: environment
+          Value: !Ref Environment
+        - Key: context
+          Value: 'infrastructure'          
+        - Key: project
+          Value: 'DEBI'
+        - Key: budgetcode
+          Value: '0000'
+        - Key: role
+          Value: euc
+        - Key: classification
+          Value: !Ref Classification
+  # --- Optional AppStream Directory Configuration Resource ---
+  # This resource is created only if EnableDirectoryConfig parameter is 'true'
+  AppStreamDirectoryConfig:
+    Type: AWS::AppStream::DirectoryConfig
+    Condition: UseDirectoryConfig # Only create if AD integration is enabled
+    Properties:
+      DirectoryName: !Ref DirectoryName
+      OrganizationalUnitDistinguishedNames: !Ref OrganizationalUnitDistinguishedNames
+      ServiceAccountCredentials:
+        AccountName: !Ref ServiceAccountUsername
+        AccountPassword: !Ref ServiceAccountPassword
+      # Note: AWS::AppStream::DirectoryConfig does not directly support 'Tags' property.
+
+  # --- AppStream Fleet Resource ---
+  AppStreamFleet:
+    Type: AWS::AppStream::Fleet
+    Properties:
+      Name: !Ref FleetName # Unique name for the fleet
+      Description: AppStream 2.0 Fleet created via CloudFormation
+      InstanceType: !Ref FleetInstanceType
+      ImageArn: arn:aws:appstream:ap-southeast-2:918473058104:image/AGD-BaseImage-01012222
+      FleetType: !Ref FleetType
+      IdleDisconnectTimeoutInSeconds: !Ref IdleDisconnectTimeoutInSeconds
+      ComputeCapacity:
+        DesiredInstances: !Ref FleetDesiredCapacity
+      IamRoleArn: !Ref FleetIamRoleArn
+      # EnableDefaultInternetAccess allows instances to reach the internet.
+      # Set to 'true' for common scenarios like software updates, but can be
+      # set to 'false' if all traffic is routed via a NAT Gateway or similar.
+      EnableDefaultInternetAccess: false
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !GetAtt AppStreamFleetSecurityGroup.GroupId
+      # Conditional DomainJoinInfo for Active Directory integration
+      DomainJoinInfo: !If
+        - UseDirectoryConfig # If AD integration is enabled
+        - DirectoryName: !Ref DirectoryName
+          OrganizationalUnitDistinguishedNames: !Ref OrganizationalUnitDistinguishedNames
+        - !Ref "AWS::NoValue" # If AD integration is disabled, omit this property
+      Tags: # Tagging for the AppStream Fleet
+        - Key: environment
+          Value: !Ref Environment
+        - Key: context
+          Value: 'infrastructure'          
+        - Key: project
+          Value: 'DEBI'
+        - Key: budgetcode
+          Value: '0000'
+        - Key: role
+          Value: euc
+        - Key: classification
+          Value: !Ref Classification
+
+  # --- AppStream Stack and Fleet Association Resource ---
+  # This resource links the created Stack and Fleet
+  AppStreamStackFleetAssociation:
+    Type: AWS::AppStream::StackFleetAssociation
+    Properties:
+      FleetName: !Ref AppStreamFleet # References the logical ID of the Fleet
+      StackName: !Ref AppStreamStack # References the logical ID of the Stack
+
+Outputs:
+  # --- Outputs for easy access to deployed resource details ---
+  AppStreamStackName:
+    Description: The Name of the created AppStream Stack.
+    Value: !Ref AppStreamStack
+  AppStreamFleetName:
+    Description: The Name of the created AppStream Fleet.
+    Value: !Ref AppStreamFleet
