@@ -1,0 +1,11 @@
+Jumpstart Configuration File
+
+Secret
+
+arn:aws:secretsmanager:ap-southeast-2:686103970965:secret:agd-data-analysis/sandpit/secretsmanager/rds-master-secret-6jx8E8
+
+arn:aws:secretsmanager:ap-southeast-2:686103970965:secret:rds!db-2f7a9cc5-ac69-417b-a048-b188d3cacb07-uxbE8w
+
+Database Endpoint
+
+agd-data-analysis-dev-rds-sql.czs880iiiiek.ap-southeast-2.rds.amazonaws.com
