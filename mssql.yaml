@@ -1,0 +1,288 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template to deploy an Amazon RDS for SQL Server Express Edition for a DEV/TEST environment.
+  This template creates a single-AZ DB Instance with comprehensive tagging and 'agd-data-analysis' naming convention.
+
+Parameters:
+  Environment:
+    Description: 'The deployment environment for this resource. Used in resource naming and tagging.'
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    ConstraintDescription: Must be a valid environment name.
+
+  Classification:
+    Description: 'The data classification level of the resource.'
+    Type: String
+    Default: Unclassified
+    AllowedValues:
+      - Unclassified
+      - Official
+      - Protected
+    ConstraintDescription: Must be a valid classification level.
+
+  DBInstanceIdentifier:
+    Description: 'The unique identifier for the RDS instance. Convention: agd-data-analysis-<environment>-rds-<name>.'
+    Type: String
+    Default: agd-data-analysis-dev-rds-sql
+    MinLength: '1'
+    MaxLength: '63'
+    AllowedPattern: "^[a-z]([a-z0-9-]*[a-z0-9])?$"
+    ConstraintDescription: Must begin with a letter and contain only lowercase letters, numbers, and hyphens.
+
+  DBInstanceClass:
+    Description: 'The compute and memory capacity of the DB instance.'
+    Type: String
+    Default: db.t3.small
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.r5.large
+      - db.r5.xlarge
+      - db.m5.large
+      - db.m5.xlarge
+    ConstraintDescription: Must be a valid DB instance class.
+
+  AllocatedStorage:
+    Description: 'The size of the DB instance (in GiB).'
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 16384
+    ConstraintDescription: Must be between 20 and 16384 GiB.
+
+  VpcId:
+    Description: 'The ID of the VPC where the RDS instance will be launched.'
+    Type: AWS::EC2::VPC::Id
+
+  SubnetIds:
+    Description: 'A comma-separated list of Subnet IDs. AWS requires the DB Subnet Group to span at least two Availability Zones.'
+    Type: List<AWS::EC2::Subnet::Id>
+    ConstraintDescription: Must be a list of at least two subnet IDs in different Availability Zones.
+
+  SourceSecurityGroupIdForAccess:
+    Description: '(Optional) The ID of an EC2 Security Group to allow access on port 1433. Leave blank to skip creating an ingress rule.'
+    Type: String
+    Default: ""
+
+  DeletionProtectionEnabled:
+    Description: 'Enable deletion protection for the database. Recommended to be ''true'' even for dev.'
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  AdditionalKmsUserArn:
+    Description: '(Optional) The ARN of an additional IAM user or role to grant KMS key usage permissions. Leave blank if not needed.'
+    Type: String
+    Default: ""
+
+Conditions:
+  HasAdditionalKmsUser: !Not [!Equals [!Ref AdditionalKmsUserArn, ""]]
+  HasSourceSecurityGroup: !Not [!Equals [!Ref SourceSecurityGroupIdForAccess, ""]]
+
+Resources:
+  RDSCustomKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "KMS key for agd-data-analysis-${Environment} RDS"
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Allow administration of the key by the account root
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: Allow usage by AWS RDS
+            Effect: Allow
+            Principal:
+              Service: "rds.amazonaws.com"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+          - Sid: Allow usage by AWS Secrets Manager
+            Effect: Allow
+            Principal:
+              Service: "secretsmanager.amazonaws.com"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+          - !If
+            - HasAdditionalKmsUser
+            - Sid: Allow use by additional specified principal
+              Effect: Allow
+              Principal:
+                AWS: !Ref AdditionalKmsUserArn
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:DescribeKey
+              Resource: "*"
+            - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Sub "agd-data-analysis-${Environment}-kms-rdskey"
+        - Key: environment
+          Value: !Ref Environment
+        - Key: context
+          Value: 'infrastructure'
+        - Key: project
+          Value: 'DEBI'
+        - Key: budgetcode
+          Value: '0000'
+        - Key: role
+          Value: 'euc'
+        - Key: classification
+          Value: !Ref Classification
+
+  RDSCustomKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/agd-data-analysis-${Environment}-kms-rdskey"
+      TargetKeyId: !GetAtt RDSCustomKMSKey.Arn
+
+  RDSMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub "Master user credentials for the ${DBInstanceIdentifier} RDS instance"
+      Name: !Sub "agd-data-analysis/${Environment}/secretsmanager/rds-master-secret"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"masteruser"}'
+        GenerateStringKey: "password"
+        PasswordLength: 30
+        ExcludeCharacters: "\"@/\\'"
+        RequireEachIncludedType: true
+      KmsKeyId: !Ref RDSCustomKMSKey
+      Tags:
+        - Key: Name
+          Value: !Sub "agd-data-analysis-${Environment}-secretsmanager-rds-master-secret"
+        - Key: environment
+          Value: !Ref Environment
+        - Key: context
+          Value: 'infrastructure'
+        - Key: project
+          Value: 'DEBI'
+        - Key: budgetcode
+          Value: '0000'
+        - Key: role
+          Value: 'euc'
+        - Key: classification
+          Value: !Ref Classification
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Controls access to the ${DBInstanceIdentifier} RDS instance"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress: !If
+        - HasSourceSecurityGroup
+        - - IpProtocol: tcp
+            FromPort: 1433
+            ToPort: 1433
+            SourceSecurityGroupId: !Ref SourceSecurityGroupIdForAccess
+        - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Sub "agd-data-analysis-${Environment}-ec2-sg-rds"
+        - Key: environment
+          Value: !Ref Environment
+        - Key: context
+          Value: 'infrastructure'
+        - Key: project
+          Value: 'DEBI'
+        - Key: budgetcode
+          Value: '0000'
+        - Key: role
+          Value: 'euc'
+        - Key: classification
+          Value: !Ref Classification
+
+  RDSDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "Subnet group for ${DBInstanceIdentifier}"
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub "agd-data-analysis-${Environment}-rds-sng-sql"
+        - Key: environment
+          Value: !Ref Environment
+        - Key: context
+          Value: 'infrastructure'
+        - Key: project
+          Value: 'DEBI'
+        - Key: budgetcode
+          Value: '0000'
+        - Key: role
+          Value: 'euc'
+        - Key: classification
+          Value: !Ref Classification
+
+  MyDBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Ref DBInstanceIdentifier
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref AllocatedStorage
+      Engine: sqlserver-ex
+      EngineVersion: "15.00"
+      LicenseModel: license-included
+      MasterUserSecret:
+        SecretArn: !Ref RDSMasterSecret
+      VPCSecurityGroups:
+        - !GetAtt RDSSecurityGroup.GroupId
+      DBSubnetGroupName: !Ref RDSDBSubnetGroup
+      MultiAZ: false
+      StorageType: gp2
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "03:00-05:00"
+      PreferredMaintenanceWindow: "mon:06:00-mon:07:00"
+      PubliclyAccessible: false
+      StorageEncrypted: true
+      KmsKeyId: !GetAtt RDSCustomKMSKey.Arn
+      DeletionProtection: !Ref DeletionProtectionEnabled
+      Tags:
+        - Key: Name
+          Value: !Ref DBInstanceIdentifier
+        - Key: environment
+          Value: !Ref Environment
+        - Key: context
+          Value: 'infrastructure'
+        - Key: project
+          Value: 'DEBI'
+        - Key: budgetcode
+          Value: '0000'
+        - Key: role
+          Value: 'euc'
+        - Key: classification
+          Value: !Ref Classification
+
+Outputs:
+  DBEndpointAddress:
+    Description: 'The endpoint address of the RDS DB instance.'
+    Value: !GetAtt MyDBInstance.Endpoint.Address
+  DBEndpointPort:
+    Description: 'The port of the RDS DB instance.'
+    Value: !GetAtt MyDBInstance.Endpoint.Port
+  RDSSecurityGroupId:
+    Description: 'The ID of the RDS Security Group.'
+    Value: !Ref RDSSecurityGroup
+  KMSKeyArn:
+    Description: 'The ARN of the KMS Key.'
+    Value: !GetAtt RDSCustomKMSKey.Arn
+  RDSMasterSecretArn:
+    Description: 'The ARN of the Secrets Manager secret.'
+    Value: !Ref RDSMasterSecret
