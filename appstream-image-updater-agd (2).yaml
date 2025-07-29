@@ -1,0 +1,542 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation stack to automate AppStream 2.0 Image updates monthly
+  using Step Functions and Lambda. This version enforces AGD-BaseImage-ddmmyyyy naming.
+
+Parameters:
+  AppStreamFleetName:
+    Type: String
+    Description: The name of the AppStream 2.0 Fleet to update.
+  AppStreamBaseImageName:
+    Type: String
+    Description: The name of the AppStream 2.0 base image to use for the new image.
+  AppStreamImageBuilderInstanceType:
+    Type: String
+    Description: The instance type for the AppStream 2.0 Image Builder.
+    Default: stream.standard.medium
+  AppStreamImageBuilderNamePrefix:
+    Type: String
+    Description: A prefix for the AppStream Image Builder name.
+    Default: MonthlyImageBuilder
+  ScheduleExpression:
+    Type: String
+    Description: The cron expression for the monthly trigger (e.g., 'cron(0 0 1 * ? *)' for 1st of every month at midnight UTC).
+    Default: cron(0 0 1 * ? *) # Example: 1st of every month at midnight UTC
+
+Resources:
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AppStreamUpdatePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - appstream:CreateImageBuilder
+                  - appstream:StartImageBuilder
+                  - appstream:DescribeImageBuilders
+                  - appstream:StopImageBuilder
+                  - appstream:CreateImage
+                  - appstream:DeleteImageBuilder
+                  - appstream:DescribeImages
+                  - appstream:DeleteImage
+                  - appstream:UpdateFleet
+                  - appstream:DescribeFleets
+                Resource: '*' # Be more restrictive in production, specify ARNs if possible
+
+  # Lambda Function to manage AppStream operations
+  AppStreamUpdaterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'AppStreamUpdater-${AWS::StackName}'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900 # 15 minutes, can be adjusted based on image builder/image creation time
+      Environment:
+        Variables:
+          FLEET_NAME: !Ref AppStreamFleetName
+          BASE_IMAGE_NAME: !Ref AppStreamBaseImageName
+          IMAGE_BUILDER_INSTANCE_TYPE: !Ref AppStreamImageBuilderInstanceType
+          IMAGE_BUILDER_NAME_PREFIX: !Ref AppStreamImageBuilderNamePrefix
+    #      MANUAL_STOP_REQUIRED: !Ref ManualImageBuilderStopRequired # Pass new parameter
+
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          from datetime import datetime
+
+          appstream = boto3.client('appstream')
+
+          def handler(event, context):
+              fleet_name = os.environ['FLEET_NAME']
+              base_image_name = os.environ['BASE_IMAGE_NAME']
+              image_builder_instance_type = os.environ['IMAGE_BUILDER_INSTANCE_TYPE']
+              image_builder_name_prefix = os.environ['IMAGE_BUILDER_NAME_PREFIX']
+              manual_stop_required = os.environ.get('MANUAL_STOP_REQUIRED', 'YES') == 'YES' # Default to YES
+
+              current_date_suffix = datetime.now().strftime("%d%m%Y") # Format: ddmmyyyy
+              current_time_suffix = datetime.now().strftime("%Y%m%d%H%M%S") # For image builder uniqueness
+
+              image_builder_name = event.get('imageBuilderName', f"{image_builder_name_prefix}-{current_time_suffix}")
+              new_image_name = event.get('newImageName', f"AGD-BaseImage-{current_date_suffix}")
+
+              state = event.get('state', 'INIT')
+              image_builder_arn = event.get('imageBuilderArn')
+              image_arn = event.get('imageArn')
+              image_builder_created_by_step = event.get('imageBuilderCreatedByStep', False)
+
+              print(f"Current state: {state}")
+              print(f"Event: {json.dumps(event)}")
+              print(f"Manual Stop Required: {manual_stop_required}")
+
+              try:
+                  if state == 'INIT':
+                      print(f"Creating and starting Image Builder: {image_builder_name} from {base_image_name}")
+                      response = appstream.create_image_builder(
+                          Name=image_builder_name,
+                          ImageName=base_image_name,
+                          InstanceType=image_builder_instance_type,
+                          Description=f"Monthly image update for {fleet_name}"
+                      )
+                      image_builder_arn = response['ImageBuilder']['Arn']
+                      print(f"Image Builder ARN: {image_builder_arn}")
+
+                      appstream.start_image_builder(Name=image_builder_name)
+                      print(f"Image Builder '{image_builder_name}' started.")
+
+                      return {
+                          'state': 'WAIT_FOR_IMAGE_BUILDER_RUNNING',
+                          'imageBuilderName': image_builder_name,
+                          'imageBuilderArn': image_builder_arn,
+                          'newImageName': new_image_name,
+                          'imageBuilderCreatedByStep': True
+                      }
+
+                  elif state == 'WAIT_FOR_IMAGE_BUILDER_RUNNING':
+                      print(f"Checking status of Image Builder: {image_builder_name}")
+                      response = appstream.describe_image_builders(Names=[image_builder_name])
+                      if not response['ImageBuilders']:
+                          raise Exception(f"Image Builder '{image_builder_name}' not found.")
+                      status = response['ImageBuilders'][0]['State']
+                      print(f"Image Builder state: {status}")
+
+                      if status == 'RUNNING':
+                          if manual_stop_required:
+                              print("\n--- ACTION REQUIRED ---")
+                              print(f"Image Builder '{image_builder_name}' is RUNNING.")
+                              print("Please connect to the Image Builder via the AppStream 2.0 console,")
+                              print("install/update applications, and optimize the image.")
+                              print("Once done, STOP the Image Builder FROM THE APPSTREAM CONSOLE.")
+                              print("The Step Function will then detect the 'STOPPED' state and proceed.")
+                              print("--- ACTION REQUIRED ---\n")
+                              # Remain in this state until manually stopped and detected by WAIT_FOR_IMAGE_BUILDER_STOPPED
+                              # Or, for the prompt flow, we would return WAIT_FOR_IMAGE_BUILDER_STOPPED here, and the user
+                              # would manually stop it. Let's make it transition to an explicit stop action.
+                              return {
+                                  'state': 'WAIT_FOR_MANUAL_IMAGE_BUILDER_STOP', # New state for manual stop
+                                  'imageBuilderName': image_builder_name,
+                                  'imageBuilderArn': image_builder_arn,
+                                  'newImageName': new_image_name,
+                                  'imageBuilderCreatedByStep': image_builder_created_by_step
+                              }
+                          else:
+                              # If manual stop is NOT required, we proceed to initiate the stop
+                              print(f"Image Builder '{image_builder_name}' is RUNNING. Proceeding to STOP it programmatically.")
+                              return {
+                                  'state': 'STOP_IMAGE_BUILDER', # Transition to the stop state
+                                  'imageBuilderName': image_builder_name,
+                                  'imageBuilderArn': image_builder_arn,
+                                  'newImageName': new_image_name,
+                                  'imageBuilderCreatedByStep': image_builder_created_by_step
+                              }
+
+                      elif status == 'STOPPED':
+                          print(f"Image Builder '{image_builder_name}' is already STOPPED. Proceeding to create image.")
+                          return {
+                              'state': 'CREATE_IMAGE',
+                              'imageBuilderName': image_builder_name,
+                              'imageBuilderArn': image_builder_arn,
+                              'newImageName': new_image_name,
+                              'imageBuilderCreatedByStep': image_builder_created_by_step
+                          }
+                      elif status in ['PENDING', 'BUILDING', 'UPDATING_APPSTREAM']:
+                          print(f"Image Builder '{image_builder_name}' is still in {status} state. Returning current state to re-evaluate.")
+                          return {
+                              'state': 'WAIT_FOR_IMAGE_BUILDER_RUNNING',
+                              'imageBuilderName': image_builder_name,
+                              'imageBuilderArn': image_builder_arn,
+                              'newImageName': new_image_name,
+                              'imageBuilderCreatedByStep': image_builder_created_by_step
+                          }
+                      else:
+                          raise Exception(f"Image Builder '{image_builder_name}' is in unexpected state: {status}")
+
+                  # NEW STATE FOR MANUAL STOP WAITING
+                  elif state == 'WAIT_FOR_MANUAL_IMAGE_BUILDER_STOP':
+                      print(f"Waiting for manual stop of Image Builder: {image_builder_name}")
+                      response = appstream.describe_image_builders(Names=[image_builder_name])
+                      if not response['ImageBuilders']:
+                          raise Exception(f"Image Builder '{image_builder_name}' not found.")
+                      status = response['ImageBuilders'][0]['State']
+                      print(f"Image Builder state: {status}")
+
+                      if status == 'STOPPED':
+                          print(f"Image Builder '{image_builder_name}' has been manually STOPPED. Proceeding to create image.")
+                          return {
+                              'state': 'CREATE_IMAGE',
+                              'imageBuilderName': image_builder_name,
+                              'imageBuilderArn': image_builder_arn,
+                              'newImageName': new_image_name,
+                              'imageBuilderCreatedByStep': image_builder_created_by_step
+                          }
+                      elif status == 'RUNNING':
+                          print(f"Image Builder '{image_builder_name}' is still RUNNING. Awaiting manual stop.")
+                          return {
+                              'state': 'WAIT_FOR_MANUAL_IMAGE_BUILDER_STOP', # Keep looping here
+                              'imageBuilderName': image_builder_name,
+                              'imageBuilderArn': image_builder_arn,
+                              'newImageName': new_image_name,
+                              'imageBuilderCreatedByStep': image_builder_created_by_step
+                          }
+                      else:
+                          print(f"Image Builder '{image_builder_name}' is in unexpected state for manual stop: {status}. Will retry.")
+                          return { # Allow retry for other transient states while waiting for manual stop
+                              'state': 'WAIT_FOR_MANUAL_IMAGE_BUILDER_STOP',
+                              'imageBuilderName': image_builder_name,
+                              'imageBuilderArn': image_builder_arn,
+                              'newImageName': new_image_name,
+                              'imageBuilderCreatedByStep': image_builder_created_by_step
+                          }
+
+                  # NEW STATE FOR AUTOMATED STOP
+                  elif state == 'STOP_IMAGE_BUILDER':
+                      print(f"Initiating automated stop for Image Builder: {image_builder_name}")
+                      appstream.stop_image_builder(Name=image_builder_name)
+                      print(f"Stop command issued for Image Builder '{image_builder_name}'.")
+                      return {
+                          'state': 'WAIT_FOR_IMAGE_BUILDER_STOPPED', # Now wait for it to actually stop
+                          'imageBuilderName': image_builder_name,
+                          'imageBuilderArn': image_builder_arn,
+                          'newImageName': new_image_name,
+                          'imageBuilderCreatedByStep': image_builder_created_by_step
+                      }
+
+                  elif state == 'WAIT_FOR_IMAGE_BUILDER_STOPPED':
+                      print(f"Checking status of Image Builder after stop command: {image_builder_name}")
+                      response = appstream.describe_image_builders(Names=[image_builder_name])
+                      if not response['ImageBuilders']:
+                          raise Exception(f"Image Builder '{image_builder_name}' not found.")
+                      status = response['ImageBuilders'][0]['State']
+                      print(f"Image Builder state: {status}")
+
+                      if status == 'STOPPED':
+                          print(f"Image Builder '{image_builder_name}' is now STOPPED. Proceeding to create image.")
+                          return {
+                              'state': 'CREATE_IMAGE',
+                              'imageBuilderName': image_builder_name,
+                              'imageBuilderArn': image_builder_arn,
+                              'newImageName': new_image_name,
+                              'imageBuilderCreatedByStep': image_builder_created_by_step
+                          }
+                      elif status in ['PENDING', 'BUILDING', 'UPDATING_APPSTREAM', 'STOPPING', 'RUNNING']:
+                          # If still running or stopping, keep waiting. 'RUNNING' could mean the stop command hasn't taken effect yet.
+                          print(f"Image Builder '{image_builder_name}' is still in {status} state. Returning current state to re-evaluate.")
+                          return {
+                              'state': 'WAIT_FOR_IMAGE_BUILDER_STOPPED', # Loop back to this state
+                              'imageBuilderName': image_builder_name,
+                              'imageBuilderArn': image_builder_arn,
+                              'newImageName': new_image_name,
+                              'imageBuilderCreatedByStep': image_builder_created_by_step
+                          }
+                      else:
+                          raise Exception(f"Image Builder '{image_builder_name}' is in unexpected state during stop wait: {status}")
+
+                  elif state == 'CREATE_IMAGE':
+                      print(f"Creating image '{new_image_name}' from Image Builder '{image_builder_name}'")
+                      response = appstream.create_image(
+                          Name=new_image_name,
+                          ImageBuilderName=image_builder_name,
+                          Description=f"Monthly update for {fleet_name} - {datetime.now().strftime('%Y-%m')}"
+                      )
+                      image_arn = response['Image']['Arn']
+                      print(f"New Image ARN: {image_arn}")
+                      return {
+                          'state': 'WAIT_FOR_IMAGE_AVAILABLE',
+                          'imageBuilderName': image_builder_name,
+                          'imageBuilderArn': image_builder_arn,
+                          'newImageName': new_image_name,
+                          'imageArn': image_arn,
+                          'imageBuilderCreatedByStep': image_builder_created_by_step
+                      }
+
+                  elif state == 'WAIT_FOR_IMAGE_AVAILABLE':
+                      print(f"Checking status of new image: {new_image_name}")
+                      response = appstream.describe_images(Names=[new_image_name])
+                      if not response['Images']:
+                          raise Exception(f"Image '{new_image_name}' not found.")
+                      status = response['Images'][0]['State']
+                      print(f"New Image state: {status}")
+
+                      if status == 'AVAILABLE':
+                          return {
+                              'state': 'UPDATE_FLEET',
+                              'imageBuilderName': image_builder_name,
+                              'imageBuilderArn': image_builder_arn,
+                              'newImageName': new_image_name,
+                              'imageArn': image_arn,
+                              'imageBuilderCreatedByStep': image_builder_created_by_step
+                          }
+                      elif status in ['PENDING', 'CREATING']:
+                          print(f"Image '{new_image_name}' is still in {status} state. Returning current state to re-evaluate.")
+                          return {
+                              'state': 'WAIT_FOR_IMAGE_AVAILABLE',
+                              'imageBuilderName': image_builder_name,
+                              'imageBuilderArn': image_builder_arn,
+                              'newImageName': new_image_name,
+                              'imageArn': image_arn,
+                              'imageBuilderCreatedByStep': image_builder_created_by_step
+                          }
+                      else:
+                          raise Exception(f"Image '{new_image_name}' is in unexpected state: {status}")
+
+                  elif state == 'UPDATE_FLEET':
+                      print(f"Updating fleet '{fleet_name}' to use new image '{new_image_name}'")
+                      response = appstream.update_fleet(
+                          Name=fleet_name,
+                          ImageName=new_image_name
+                      )
+                      print(f"Fleet '{fleet_name}' update initiated.")
+                      return {
+                          'state': 'CLEANUP',
+                          'imageBuilderName': image_builder_name,
+                          'imageBuilderArn': image_builder_arn,
+                          'newImageName': new_image_name,
+                          'imageArn': image_arn,
+                          'imageBuilderCreatedByStep': image_builder_created_by_step
+                      }
+
+                  elif state == 'CLEANUP':
+                      print(f"Performing cleanup. Image Builder Name: {image_builder_name}, Created by Step: {image_builder_created_by_step}")
+
+                      if image_builder_created_by_step and image_builder_name:
+                          try:
+                              response = appstream.describe_image_builders(Names=[image_builder_name])
+                              if response['ImageBuilders'] and response['ImageBuilders'][0]['State'] != 'DELETED':
+                                  current_builder_state = response['ImageBuilders'][0]['State']
+                                  if current_builder_state in ['RUNNING', 'PENDING', 'STOPPING']:
+                                      print(f"Stopping Image Builder '{image_builder_name}' before deletion.")
+                                      appstream.stop_image_builder(Name=image_builder_name)
+                                      while True:
+                                          response = appstream.describe_image_builders(Names=[image_builder_name])
+                                          if not response['ImageBuilders'] or response['ImageBuilders'][0]['State'] == 'STOPPED':
+                                              break
+                                          time.sleep(10)
+
+                                  print(f"Deleting Image Builder: {image_builder_name}")
+                                  appstream.delete_image_builder(Name=image_builder_name)
+                                  print(f"Image Builder '{image_builder_name}' deleted.")
+                          except Exception as e:
+                              print(f"Warning: Could not delete Image Builder '{image_builder_name}': {e}")
+                      else:
+                          print("Image Builder was not created by this step function or name is missing, skipping deletion.")
+
+                      print("AppStream Image Update workflow completed successfully!")
+                      return {'status': 'SUCCESS', 'newImageName': new_image_name}
+
+                  else:
+                      raise Exception(f"Unknown state: {state}")
+
+              except Exception as e:
+                  print(f"Error in AppStreamUpdaterFunction: {e}")
+                  raise e
+
+  # IAM Role for Step Functions State Machine
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess # Or restrict further with custom policy
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt AppStreamUpdaterFunction.Arn
+
+  # Step Functions State Machine
+  AppStreamUpdateStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub 'AppStreamImageUpdater-${AWS::StackName}'
+      DefinitionString: 
+        Fn::Sub:
+          |-
+          {
+          "Comment": "AppStream 2.0 Image Update Workflow",
+          "StartAt": "Initialize",
+          "States": {
+            "Initialize": {
+              "Type": "Pass",
+              "Result": {
+                "state": "INIT"
+              },
+              "Next": "CallLambda"
+            },
+            "CallLambda": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "Payload.$": "$",
+                "FunctionName": "${AppStreamUpdaterFunction.Arn}"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [ "Lambda.ClientException", "Lambda.ServiceException", "Lambda.AWSLambdaException" ],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 5,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [ "States.ALL" ],
+                  "Next": "Failed"
+                }
+              ],
+              "ResultPath": "$.LambdaResult",
+              "OutputPath": "$.LambdaResult.Payload",
+              "Next": "DetermineNextState"
+            },
+            "DetermineNextState": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.state",
+                  "StringEquals": "WAIT_FOR_IMAGE_BUILDER_RUNNING",
+                  "Next": "WaitForImageBuilderRunning"
+                },
+                {
+                  "Variable": "$.state",
+                  "StringEquals": "WAIT_FOR_IMAGE_BUILDER_STOPPED",
+                  "Next": "WaitForImageBuilderStopped"
+                },
+                {
+                  "Variable": "$.state",
+                  "StringEquals": "CREATE_IMAGE",
+                  "Next": "CallLambda"
+                },
+                {
+                  "Variable": "$.state",
+                  "StringEquals": "WAIT_FOR_IMAGE_AVAILABLE",
+                  "Next": "WaitForImageAvailable"
+                },
+                {
+                  "Variable": "$.state",
+                  "StringEquals": "UPDATE_FLEET",
+                  "Next": "CallLambda"
+                },
+                {
+                  "Variable": "$.state",
+                  "StringEquals": "CLEANUP",
+                  "Next": "CallLambda"
+                }
+              ],
+              "Default": "Succeeded"
+            },
+            "WaitForImageBuilderRunning": {
+              "Type": "Wait",
+              "Seconds": 300,
+              "Next": "CallLambda"
+            },
+            "WaitForImageBuilderStopped": {
+              "Type": "Wait",
+              "Seconds": 300,
+              "Next": "CallLambda"
+            },
+            "WaitForImageAvailable": {
+              "Type": "Wait",
+              "Seconds": 300,
+              "Next": "CallLambda"
+            },
+            "Succeeded": {
+              "Type": "Succeed"
+            },
+            "Failed": {
+              "Type": "Fail",
+              "Cause": "AppStream Image Update Failed",
+              "Error": "AppStream Image Update Process Failed"
+            }
+          }
+          }
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+
+  # EventBridge Rule to trigger Step Function monthly
+  MonthlyTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'AppStreamMonthlyUpdateTrigger-${AWS::StackName}'
+      Description: Triggers the AppStream Image Update Step Function monthly.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AppStreamUpdateStateMachine.Arn
+          Id: AppStreamUpdateStateMachineTarget
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+
+  # IAM Role for EventBridge to invoke Step Functions
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowStepFunctionExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !GetAtt AppStreamUpdateStateMachine.Arn
+
+Outputs:
+  AppStreamUpdaterFunctionArn:
+    Description: ARN of the Lambda function for AppStream updates.
+    Value: !GetAtt AppStreamUpdaterFunction.Arn
+  AppStreamUpdateStateMachineArn:
+    Description: ARN of the AppStream Image Update Step Functions State Machine.
+    Value: !GetAtt AppStreamUpdateStateMachine.Arn
+  MonthlyTriggerRuleArn:
+    Description: ARN of the EventBridge Rule triggering the monthly update.
+    Value: !GetAtt MonthlyTriggerRule.Arn
